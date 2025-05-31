@@ -100,14 +100,14 @@ class VizDoomEnv:
         frame = self._get_frame()
         for _ in range(self.frame_stack):
             self.stack.append(frame)
-        return np.stack(self.stack, axis=0)
+        return np.concatenate(self.stack, axis=0)
 
     def step(self, action_idx):
         reward = self.game.make_action(self.action_space[action_idx])
         done = self.game.is_episode_finished()
         next_state = self._get_frame() if not done else np.zeros_like(self.stack[0])
         self.stack.append(next_state)
-        return np.stack(self.stack, axis=0), reward, done
+        return np.concatenate(self.stack, axis=0), reward, done
 
     def _get_frame(self):
         frame = self.game.get_state().screen_buffer
@@ -127,7 +127,7 @@ def evaluate(policy_net, env, episodes=3):
         total_reward = 0
         while True:
             with torch.no_grad():
-                inp = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(next(policy_net.parameters()).device)
+                inp = torch.tensor(state, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(next(policy_net.parameters()).device)
                 q_values, _ = policy_net(inp)
                 action = q_values.argmax().item()
             state, reward, done = env.step(action)
@@ -141,7 +141,7 @@ def evaluate(policy_net, env, episodes=3):
 # ----------------------------
 def train():
     env = VizDoomEnv("ViZDoom/scenarios/basic.cfg")
-    input_shape = (3, 84, 84)
+    input_shape = (3 * 4, 84, 84)
     frame_stack = 4
     n_actions = len(env.action_space)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -154,25 +154,21 @@ def train():
     optimizer = optim.Adam(policy_net.parameters(), lr=1e-4)
     replay_buffer = ReplayBuffer(1000)
     writer = SummaryWriter()
-    missed_shot_penalty = -5
+
     batch_size = 8
     gamma = 0.99
     epsilon = 1.0
     epsilon_decay = 0.995
     min_epsilon = 0.1
     target_update = 500
-    episode_steps = 500  # increased from 5 to 100
+    episode_steps = 100
     global_step = 0
     best_reward = float('-inf')
     all_rewards = []
 
     for episode in range(1000):
         state = env.reset()
-        state_seq = []
-        action_seq = []
-        reward_seq = []
-        next_state_seq = []
-        done_seq = []
+        state_seq, action_seq, reward_seq, next_state_seq, done_seq = [], [], [], [], []
         total_reward = 0
         early_done = False
 
@@ -182,15 +178,13 @@ def train():
                 action = random.randint(0, n_actions - 1)
             else:
                 with torch.no_grad():
-                    inp = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(device)
+                    inp = torch.tensor(state, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
                     q_values, _ = policy_net(inp)
                     action = q_values.argmax().item()
 
             next_state, reward, done = env.step(action)
-
-            # Penalty for missed shot (action 2 is shoot)
             if action == 2 and reward == 0:
-                reward += missed_shot_penalty
+                reward -= 1.0
 
             state_seq.append(state)
             action_seq.append(action)
@@ -210,22 +204,16 @@ def train():
         if len(replay_buffer) >= batch_size:
             states, actions, rewards, next_states, dones = replay_buffer.sample(batch_size)
 
-            states = states.view(batch_size, episode_steps, frame_stack, 3, 84, 84)
-            states = states.permute(0, 1, 3, 2, 4, 5)
-            states = states[:, :, :, -1, :, :].to(device)
-
-            next_states = next_states.view(batch_size, episode_steps, frame_stack, 3, 84, 84)
-            next_states = next_states.permute(0, 1, 3, 2, 4, 5)
-            next_states = next_states[:, :, :, -1, :, :].to(device)
-
+            states = states.to(device)
+            next_states = next_states.to(device)
             actions = actions.to(device)
             rewards = rewards.to(device)
             dones = dones.to(device)
 
-            q_vals, _ = policy_net(states)
+            q_vals, _ = policy_net(states.unsqueeze(2))
             current_q = q_vals.gather(1, actions[:, -1].unsqueeze(1).long()).squeeze()
             with torch.no_grad():
-                next_q, _ = target_net(next_states)
+                next_q, _ = target_net(next_states.unsqueeze(2))
                 max_next_q = next_q.max(1)[0]
                 target_q = rewards[:, -1] + gamma * max_next_q * (~dones[:, -1])
 
@@ -251,7 +239,6 @@ def train():
     env.close()
     writer.close()
 
-    # Plot reward graph
     plt.figure(figsize=(10, 4))
     plt.plot(all_rewards)
     plt.title("Episode Rewards Over Time")
